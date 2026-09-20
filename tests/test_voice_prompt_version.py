@@ -256,8 +256,11 @@ class TestNewVariantInvariants:
         text = _load(version)
         words = len(text.split())
         lines = text.count("\n") + 1
-        # New variants must stay leaner than the legacy mixed prompt.
-        assert words <= 4500, f"{version} prompt grew to {words} words (limit 4500)"
+        # New variants must stay leaner than the legacy mixed prompt (~9.5k
+        # words). Raised from 4500 for the issue #271 guards — the equine ban,
+        # the retrieval-gap contract and the topic-shift rule each cost words in
+        # every variant, and a variant that drops one reopens the bug.
+        assert words <= 4700, f"{version} prompt grew to {words} words (limit 4700)"
         assert lines <= 320, f"{version} prompt grew to {lines} lines (limit 320)"
 
 

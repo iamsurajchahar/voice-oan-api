@@ -1,6 +1,6 @@
 import uuid
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 from app.core.cache import cache, redis_client, build_cache_key  # Import cache instance from core
 from app.config import settings
 from helpers.utils import get_logger, count_tokens_for_part
@@ -362,7 +362,18 @@ def trim_history(
     *,
     include_system_prompts: bool = True,
     include_tool_calls: bool = True,
+    tool_return_turns: Optional[int] = None,
 ) -> List[ModelMessage]:
+    """Fit the session's history into a token budget, newest turns first.
+
+    `tool_return_turns` bounds how far back retrieved documents travel. Assistant
+    replies are always kept — they are the conversation — but the search results
+    behind them are kept only for the most recent N turns. Without that bound a
+    whole call's retrieval piles up in front of the model, and it answers the
+    current question from whichever earlier chunks read richest: a cattle-shed
+    subsidy question came back as diarrhoea advice that way (issue #271).
+    None keeps every tool result, which is the historical behaviour.
+    """
     # 1. Pre-process system parts: strip them or keep whole messages
     prepped: List[ModelMessage] = []
     for msg in history:
@@ -432,6 +443,37 @@ def trim_history(
                 filtered.append(m2)
         if filtered:
             clean_turns.append(filtered)
+
+    # 4b. Drop tool results that belong to older turns. Calls, returns and
+    # retries are removed together by tool_call_id, so this can never leave the
+    # orphans step 4 just finished clearing.
+    if include_tool_calls and tool_return_turns is not None and tool_return_turns >= 0:
+        stale_ids = set()
+        for turn in clean_turns[:max(0, len(clean_turns) - tool_return_turns)]:
+            for m in turn:
+                for p in m.parts:
+                    if getattr(p, "part_kind", "") in ("tool-call", "tool-return", "retry-prompt"):
+                        tool_call_id = getattr(p, "tool_call_id", None)
+                        if tool_call_id:
+                            stale_ids.add(tool_call_id)
+        if stale_ids:
+            scoped_turns: List[List[ModelMessage]] = []
+            for turn in clean_turns:
+                filtered = []
+                for m in turn:
+                    kept = [p for p in m.parts if getattr(p, "tool_call_id", None) not in stale_ids]
+                    if not kept:
+                        continue
+                    if len(kept) == len(m.parts):
+                        filtered.append(m)
+                        continue
+                    m2 = deepcopy(m)
+                    m2.parts = kept
+                    filtered.append(m2)
+                if filtered:
+                    scoped_turns.append(filtered)
+            logger.info(f"Scoped tool results to last {tool_return_turns} turn(s): dropped {len(stale_ids)} call(s)")
+            clean_turns = scoped_turns
 
     # 5. Compute token-count per turn
     turn_tokens = [

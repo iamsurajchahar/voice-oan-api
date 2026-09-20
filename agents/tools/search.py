@@ -6,13 +6,19 @@ blocking the event loop when serving many concurrent requests.
 import asyncio
 import os
 import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, FrozenSet, List, Literal, Optional
 
 import marqo
 from pydantic import BaseModel, Field
 from pydantic_ai import ModelRetry, RunContext
 
 from agents.deps import FarmerContext
+from agents.services.species import (
+    hit_species,
+    off_species_penalty,
+    partition_hits_by_species,
+    resolve_caller_species,
+)
 from agents.tools.terms import normalize_text_with_glossary
 from app.observability import start_observation
 from helpers.utils import get_logger
@@ -39,6 +45,53 @@ _WRONG_INTENT_HINTS = [
     "tracking numbers",
     "track number",
 ]
+
+# Second-chance vocabulary, used only when the first search came back with
+# nothing to show. Callers say "not coming into heat"; the corpus writes
+# "anestrus". The first query is left untouched so a search that already works
+# keeps working — this only runs when the alternative is telling the farmer we
+# have no information on a core topic of this helpline (issue #271).
+_RETRY_EXPANSIONS: List[tuple] = [
+    (
+        re.compile(r"\b(heat|estrus|oestrus|anestrus|anoestrus|bulling|come?s? into heat)\b", re.I),
+        "anestrus estrus induction silent heat cycle",
+    ),
+    (
+        re.compile(r"\b(repeat breed\w*|not conceiv\w*|conception failure|repeat breeder)\b", re.I),
+        "repeat breeder conception rate infertility",
+    ),
+    (
+        re.compile(r"\b(heat detection|detect\w* heat|signs of heat|standing heat)\b", re.I),
+        "estrus detection signs standing heat timing insemination",
+    ),
+    (
+        re.compile(r"\b(shed|cowshed|housing|gaushala|byre)\b", re.I),
+        "cattle shed construction subsidy animal husbandry scheme assistance",
+    ),
+    (
+        re.compile(r"\b(subsidy|subsidies|sahay|scheme)\b", re.I),
+        "government assistance eligibility application animal husbandry department",
+    ),
+]
+
+# What the tool says when it has nothing on-topic. The wording is the contract:
+# the agent used to receive a bare "No results found" and fill the silence with
+# whatever it had retrieved a turn earlier, which is how a cattle-shed subsidy
+# question came back as diarrhoea advice (issue #271). Naming the gap and the
+# next step leaves it nothing to substitute.
+_RETRIEVAL_GAP = (
+    "No results found for `{query}`.\n\n"
+    "RETRIEVAL_GAP{reason}. Do not answer this from a neighbouring topic, from "
+    "memory, or from documents retrieved earlier in this call. Tell the caller "
+    "plainly that you do not have this information, then offer one concrete next "
+    "step: booking a veterinary health call, or their dairy society or nearest "
+    "government veterinary dispensary."
+)
+_GAP_REASON_EMPTY = ": the indexed documents have nothing on this topic"
+_GAP_REASON_SPECIES = (
+    ": every document that matched was about a different animal than this "
+    "caller's, so none of it applies"
+)
 
 
 def _validate_search_query(query: str) -> str:
@@ -191,6 +244,28 @@ def _expand_query_by_profile(query: str, profile: str) -> str:
     return cleaned
 
 
+def _expand_query_for_retry(query: str) -> Optional[str]:
+    """One widened query to try when the first one found nothing.
+
+    Returns None when no expansion applies, or when the expansion would not
+    actually change the query — there is no point paying for the same search
+    twice.
+    """
+    extras: List[str] = []
+    for pattern, expansion in _RETRY_EXPANSIONS:
+        if pattern.search(query):
+            for term in expansion.split():
+                if term not in extras:
+                    extras.append(term)
+    if not extras:
+        return None
+    lowered = query.lower()
+    novel = [term for term in extras if term.lower() not in lowered]
+    if not novel:
+        return None
+    return f"{query} {' '.join(novel)}"
+
+
 def _doc_key(hit: Dict[str, Any]) -> str:
     return (
         str(hit.get("doc_id") or "").strip()
@@ -259,9 +334,21 @@ def _metadata_blob(hit: Dict[str, Any]) -> str:
     )
 
 
-def _rerank_hits(query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _rerank_hits(
+    query: str,
+    hits: List[Dict[str, Any]],
+    allowed_species: Optional[FrozenSet[str]] = None,
+) -> List[Dict[str, Any]]:
     if not hits:
         return hits
+
+    # Same switch that governs dropping, so turning the filter off leaves both
+    # the result set and its order exactly as they were before issue #271.
+    species_weight = (
+        _parse_float_env("MARQO_OFF_SPECIES_PENALTY", 0.15)
+        if _env_bool("VOICE_SPECIES_FILTER", True)
+        else 0.0
+    )
 
     raw_scores = [float(h.get("_score", h.get("score", 0.0)) or 0.0) for h in hits]
     min_score = min(raw_scores)
@@ -279,7 +366,14 @@ def _rerank_hits(query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
         metadata_boost = 0.08 * lexical_meta
         reference_penalty = -0.12 if bool(hit.get("is_reference", False)) else 0.0
-        rerank_score = (0.62 * semantic) + (0.30 * lexical) + metadata_boost + reference_penalty
+        # Only mixed-species documents reach this — a document about nothing but
+        # another animal was already dropped before reranking.
+        species_penalty = off_species_penalty(
+            hit_species(hit, metadata_text), allowed_species, species_weight
+        )
+        rerank_score = (
+            (0.62 * semantic) + (0.30 * lexical) + metadata_boost + reference_penalty + species_penalty
+        )
 
         enriched = dict(hit)
         enriched["_rerank_score"] = rerank_score
@@ -330,7 +424,11 @@ async def search_documents(
         top_k: Requested number of final results (contract-clamped, default: 12)
     """
     try:
-        del ctx
+        # The caller's own words and herd used to be discarded here, which is
+        # what let equine documents answer a cow question (issue #271).
+        deps = getattr(ctx, "deps", None)
+        caller_utterance = str(getattr(deps, "query", "") or "")
+        farmer_info = str(getattr(deps, "farmer_info", "") or "")
         query = _validate_search_query(query)
         endpoint_url = os.getenv('MARQO_ENDPOINT_URL')
         if not endpoint_url:
@@ -366,109 +464,116 @@ async def search_documents(
             max(final_top_k * max(candidate_multiplier, 1), final_top_k),
             max(candidate_cap, final_top_k),
         )
-        expanded_query = _expand_query_by_profile(query, query_expansion_profile)
-        effective_query = _prepare_query_for_e5(expanded_query) if use_e5_query_prefix else expanded_query
-
         search_mode = (os.getenv("MARQO_SEARCH_MODE", "hybrid") or "hybrid").strip().lower()
-        search_params: Dict[str, Any] = {
-            "q": effective_query,
-            "limit": search_limit,
-        }
-        if search_mode == "hybrid":
-            search_params["search_method"] = "hybrid"
-            search_params["hybrid_parameters"] = {
-                "retrievalMethod": "disjunction",
-                "rankingMethod": "rrf",
-                "alpha": hybrid_alpha,
-                "rrfK": hybrid_rrfk,
-            }
-        elif search_mode == "tensor":
-            search_params["search_method"] = "tensor"
-        elif search_mode == "lexical":
-            search_params["search_method"] = "lexical"
-        else:
+        if search_mode not in {"hybrid", "tensor", "lexical"}:
             raise ValueError(f"Unsupported MARQO_SEARCH_MODE={search_mode}")
 
-        if exclude_reference_chunks and capabilities.get("has_is_reference_filter", False):
-            search_params["filter_string"] = "is_reference:false"
+        async def _execute(raw_query: str, attempt: str) -> List[Dict[str, Any]]:
+            expanded = _expand_query_by_profile(raw_query, query_expansion_profile)
+            effective = _prepare_query_for_e5(expanded) if use_e5_query_prefix else expanded
+            params: Dict[str, Any] = {"q": effective, "limit": search_limit}
+            if search_mode == "hybrid":
+                params["search_method"] = "hybrid"
+                params["hybrid_parameters"] = {
+                    "retrievalMethod": "disjunction",
+                    "rankingMethod": "rrf",
+                    "alpha": hybrid_alpha,
+                    "rrfK": hybrid_rrfk,
+                }
+            else:
+                params["search_method"] = search_mode
+            if exclude_reference_chunks and capabilities.get("has_is_reference_filter", False):
+                params["filter_string"] = "is_reference:false"
 
-        with start_observation(
-            "marqo_search",
-            input={"query": query, "search_params": search_params},
-            metadata={
+            base_metadata = {
                 "endpoint_url": endpoint_url,
                 "index_name": index_name,
                 "search_mode": search_mode,
                 "query_expansion_profile": query_expansion_profile,
+                "attempt": attempt,
                 "tool": "search_documents",
-            },
-        ) as observation:
-            try:
-                results = await asyncio.to_thread(_marqo_search_sync, endpoint_url, index_name, search_params)
-            except Exception as e:
-                if search_mode == "hybrid":
-                    logger.warning("Hybrid search failed, retrying with tensor search for query '%s'", query)
-                    fallback_params = {
-                        "q": effective_query,
-                        "limit": search_limit,
-                        "search_method": "tensor",
-                    }
+            }
+            with start_observation(
+                "marqo_search",
+                input={"query": raw_query, "search_params": params},
+                metadata=base_metadata,
+            ) as observation:
+                try:
+                    hits = await asyncio.to_thread(_marqo_search_sync, endpoint_url, index_name, params)
+                except Exception as e:
+                    if search_mode != "hybrid":
+                        if observation is not None:
+                            observation.update(output={"error": str(e)}, metadata=base_metadata)
+                        raise
+                    logger.warning("Hybrid search failed, retrying with tensor search for query '%s'", raw_query)
+                    fallback_params = {"q": effective, "limit": search_limit, "search_method": "tensor"}
                     if exclude_reference_chunks and capabilities.get("has_is_reference_filter", False):
                         fallback_params["filter_string"] = "is_reference:false"
                     if observation is not None:
                         observation.update(
-                            metadata={
-                                "endpoint_url": endpoint_url,
-                                "index_name": index_name,
-                                "search_mode": search_mode,
-                                "fallback_mode": "tensor",
-                                "initial_error": str(e),
-                                "tool": "search_documents",
-                            }
+                            metadata={**base_metadata, "fallback_mode": "tensor", "initial_error": str(e)}
                         )
-                    results = await asyncio.to_thread(_marqo_search_sync, endpoint_url, index_name, fallback_params)
-                else:
-                    if observation is not None:
-                        observation.update(
-                            output={"error": str(e)},
-                            metadata={
-                                "endpoint_url": endpoint_url,
-                                "index_name": index_name,
-                                "search_mode": search_mode,
-                                "tool": "search_documents",
-                            },
-                        )
-                    raise
+                    hits = await asyncio.to_thread(
+                        _marqo_search_sync, endpoint_url, index_name, fallback_params
+                    )
 
-            if observation is not None:
-                observation.update(
-                    output={"hit_count": len(results)},
-                    metadata={
-                        "endpoint_url": endpoint_url,
-                        "index_name": index_name,
-                        "search_mode": search_mode,
-                        "query_expansion_profile": query_expansion_profile,
-                        "tool": "search_documents",
-                    },
-                )
+                if observation is not None:
+                    observation.update(output={"hit_count": len(hits)}, metadata=base_metadata)
+            return hits
 
+        # Who the answer is for. Decided once, from the caller's utterance, the
+        # model's query and the herd on file — in that order of authority.
+        # VOICE_SPECIES_FILTER=false restores the pre-#271 behaviour outright:
+        # no hit is dropped and no hit is demoted.
+        species_filter_on = _env_bool("VOICE_SPECIES_FILTER", True)
+        allowed_species = (
+            resolve_caller_species(caller_utterance, query, farmer_info) if species_filter_on else None
+        )
+
+        def _partition(hits: List[Dict[str, Any]]):
+            if not species_filter_on:
+                return hits, []
+            return partition_hits_by_species(hits, allowed_species, _metadata_blob)
+
+        results = await _execute(query, "primary")
+        kept, dropped = _partition(results)
+        gap_reason = _GAP_REASON_SPECIES if (dropped and not kept) else _GAP_REASON_EMPTY
+        if dropped:
+            logger.info(
+                "Species filter dropped %s/%s hits: query=%s allowed=%s",
+                len(dropped), len(results), query, sorted(allowed_species) if allowed_species else "any",
+            )
+
+        # Nothing survived. Widen the vocabulary once before conceding a gap —
+        # the corpus says "anestrus" where the caller says "not coming into heat".
+        retry_query = _expand_query_for_retry(query) if not kept else None
+        if retry_query:
+            logger.info("Empty result set; retrying with expanded query=%s", retry_query)
+            retry_results = await _execute(retry_query, "expanded")
+            retry_kept, retry_dropped = _partition(retry_results)
+            if retry_kept:
+                kept = retry_kept
+            elif retry_dropped:
+                gap_reason = _GAP_REASON_SPECIES
+
+        results = kept
         rerank_mode = (os.getenv("MARQO_RERANK_MODE", "bm25lite") or "bm25lite").strip().lower()
         if rerank_mode not in {"off", "none", "disabled"}:
-            results = _rerank_hits(query, results)
+            results = _rerank_hits(query, results, allowed_species)
         results = _apply_doc_diversity(results, top_k=final_top_k, max_per_doc=max_per_doc)
 
         logger.info(
-            "Search completed: query=%s expanded_query=%s mode=%s top_k=%s hits=%s profile=%s",
+            "Search completed: query=%s mode=%s top_k=%s hits=%s profile=%s allowed_species=%s",
             query,
-            expanded_query,
             search_mode,
             final_top_k,
             len(results),
             query_expansion_profile,
+            sorted(allowed_species) if allowed_species else "any",
         )
 
         if len(results) == 0:
-            return f"No results found for `{query}`"
+            return _RETRIEVAL_GAP.format(query=query, reason=gap_reason)
 
         search_hits = []
         for hit in results:

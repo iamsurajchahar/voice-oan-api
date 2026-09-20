@@ -215,6 +215,12 @@ class Settings(BaseSettings):
     retrieval_audit_log: bool = _get_bool_env("RETRIEVAL_AUDIT_LOG", default=False)
     # AMBIGUITY_MATCH_THRESHOLD: fuzzy-match cutoff for ambiguity_terms.json (0.0–1.0)
     ambiguity_match_threshold: float = float(os.getenv("AMBIGUITY_MATCH_THRESHOLD", "0.80"))
+    # HISTORY_TOOL_RETURN_TURNS: how many recent turns keep their retrieved
+    # documents in the model's context. Assistant replies are never dropped —
+    # only the search results behind older ones, so this turn's question cannot
+    # be answered from a previous turn's topic (issue #271). 0 disables reuse
+    # entirely; a negative value keeps every turn's results.
+    history_tool_return_turns: int = int(os.getenv("HISTORY_TOOL_RETURN_TURNS", "2"))
     ollama_endpoint_url: Optional[str] = None
     marqo_endpoint_url: Optional[str] = None
     inference_endpoint_url: Optional[str] = None

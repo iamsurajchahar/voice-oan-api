@@ -2584,6 +2584,14 @@ async def stream_voice_message(
                 max_tokens=32_000,
                 include_system_prompts=False,
                 include_tool_calls=True,
+                # Older turns keep their replies but lose their retrieved
+                # documents, so this turn cannot be answered out of a previous
+                # turn's search results (issue #271).
+                tool_return_turns=(
+                    settings.history_tool_return_turns
+                    if settings.history_tool_return_turns >= 0
+                    else None
+                ),
             )
             logger.info(f"Trimmed history length: {len(trimmed_history)} messages")
             # pydantic-ai's Agent(instructions=STATIC_VOICE_SYSTEM_PROMPT) already
